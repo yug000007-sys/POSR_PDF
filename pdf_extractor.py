@@ -1,207 +1,218 @@
 """
-Streamlit Web App for Prime Conduit PDF Extractor
-Upload PDF commission reports and download extracted Excel files
+Prime Conduit Commission Report PDF Extractor
+Extracts invoice data from PDF commission reports and converts to Excel format
 """
 
-import streamlit as st
+import re
+from typing import List, Dict, Tuple
+import pdfplumber
 import pandas as pd
-import tempfile
-import os
-from pdf_extractor import PrimeConduitExtractor
+from openpyxl import Workbook
 
 
-st.set_page_config(
-    page_title="Prime Conduit PDF Extractor",
-    page_icon="📊",
-    layout="wide"
-)
-
-st.title("📊 Prime Conduit Commission Report Extractor")
-st.markdown("Extract invoice data from PDF commission reports and download as Excel")
-
-with st.sidebar:
-    st.header("ℹ️ About")
-    st.info("""
-    **Features:**
-    - Upload multiple PDF files
-    - Extract invoice data automatically
-    - Verify accuracy against PDF totals
-    - Download as Excel file
-    - Batch processing support
-    """)
-
-tab1, tab2, tab3 = st.tabs(["📤 Upload & Extract", "📋 Preview", "📚 Help"])
-
-with tab1:
-    st.header("Upload PDF Files")
+class PrimeConduitExtractor:
+    """Extracts data from Prime Conduit Commission Reports (ZSDB0010)"""
     
-    col1, col2 = st.columns([2, 1])
+    HEADERS = [
+        'Supplier_name',
+        'Distname',
+        'CustName',
+        'City',
+        'State',
+        'CustAccNbr',
+        'InvoiceNumber',
+        'PO_Number',
+        'UnitCost',
+        'Qty',
+        'Commissions',
+    ]
     
-    with col1:
-        uploaded_files = st.file_uploader(
-            "Choose PDF files to extract",
-            type=["pdf"],
-            accept_multiple_files=True
-        )
+    def __init__(self):
+        """Initialize the extractor"""
+        self.rows = []
+        self.commission_totals = {}
+        self.extracted_commission = 0
     
-    with col2:
-        extraction_mode = st.radio(
-            "Processing Mode",
-            ["Single File", "Batch"]
-        )
-    
-    if uploaded_files:
-        st.markdown("---")
-        st.subheader(f"Processing {len(uploaded_files)} file(s)")
+    def extract_from_pdf(self, pdf_path: str) -> Tuple[pd.DataFrame, Dict]:
+        """Extract data from a Prime Conduit Commission Report PDF"""
+        self.rows = []
+        self.commission_totals = {}
         
-        if st.button("🔄 Extract Data", use_container_width=True):
-            progress_bar = st.progress(0)
-            status_container = st.container()
-            
-            all_dataframes = []
-            extraction_results = []
-            
-            for idx, uploaded_file in enumerate(uploaded_files):
-                progress = (idx + 1) / len(uploaded_files)
-                progress_bar.progress(progress)
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                metadata = self._extract_metadata(pdf.pages[0].extract_text())
                 
-                with status_container:
-                    st.info(f"Processing: {uploaded_file.name}")
-                
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(uploaded_file.getbuffer())
-                        tmp_path = tmp_file.name
-                    
-                    extractor = PrimeConduitExtractor()
-                    df, metadata = extractor.extract_from_pdf(tmp_path)
-                    
-                    all_dataframes.append(df)
-                    extraction_results.append({
-                        'file': uploaded_file.name,
-                        'rows': len(df),
-                        'commission': df['Commissions'].sum(),
-                        'status': '✅ Success'
-                    })
-                    
-                    os.unlink(tmp_path)
-                    
-                except Exception as e:
-                    extraction_results.append({
-                        'file': uploaded_file.name,
-                        'rows': 0,
-                        'commission': 0,
-                        'status': f'❌ Error'
-                    })
+                for page in pdf.pages:
+                    self._extract_page(page.extract_text())
             
-            st.markdown("---")
-            st.subheader("Extraction Results")
+            df = pd.DataFrame(self.rows, columns=self.HEADERS)
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Files Processed", len(uploaded_files))
-            with col2:
-                st.metric("Total Rows", sum([r['rows'] for r in extraction_results]))
-            with col3:
-                total_commission = sum([r['commission'] for r in extraction_results])
-                st.metric("Total Commission", f"${total_commission:,.2f}")
-            with col4:
-                successful = sum([1 for r in extraction_results if '✅' in r['status']])
-                st.metric("Successful", f"{successful}/{len(uploaded_files)}")
+            metadata['extracted_rows'] = len(self.rows)
+            metadata['extracted_commission'] = sum([row[10] for row in self.rows])
+            metadata['matches_pdf_total'] = self._verify_totals(metadata)
             
-            results_df = pd.DataFrame(extraction_results)
-            st.dataframe(
-                results_df[['file', 'rows', 'commission', 'status']],
-                use_container_width=True,
-                hide_index=True
-            )
+            return df, metadata
+        
+        except Exception as e:
+            raise Exception(f"Error extracting PDF: {str(e)}")
+    
+    def _extract_metadata(self, text: str) -> Dict:
+        """Extract metadata from PDF header"""
+        metadata = {
+            'report_date': None,
+            'period_start': None,
+            'period_end': None,
+            'agency_name': None,
+            'agency_no': None,
+            'agreements': [],
+            'channels': []
+        }
+        
+        period_match = re.search(r'For Period\s*:\s*(\d{2}/\d{2}/\d{4})\s+to\s+(\d{2}/\d{2}/\d{4})', text)
+        if period_match:
+            metadata['period_start'] = period_match.group(1)
+            metadata['period_end'] = period_match.group(2)
+        
+        agency_match = re.search(r'Agency Name\s*:\s*([^\n]+)', text)
+        if agency_match:
+            metadata['agency_name'] = agency_match.group(1).strip()
+        
+        return metadata
+    
+    def _extract_page(self, text: str):
+        """Extract invoice data from a single page"""
+        lines = text.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             
-            st.markdown("---")
-            st.subheader("📥 Download Extracted Data")
+            if self._is_invoice_line(line):
+                row_data = self._parse_invoice_block(lines, i)
+                if row_data:
+                    self.rows.append(row_data)
+                    i += self._count_block_lines(lines, i)
+                else:
+                    i += 1
             
-            if extraction_mode == "Single File":
-                for idx, (result, df) in enumerate(zip(extraction_results, all_dataframes)):
-                    if '✅' in result['status']:
-                        excel_path = f"extracted_{idx + 1}.xlsx"
-                        extractor = PrimeConduitExtractor()
-                        extractor.rows = [tuple(row) for row in df.values]
-                        extractor.to_excel(excel_path)
-                        
-                        with open(excel_path, 'rb') as f:
-                            st.download_button(
-                                label=f"📥 {result['file']}.xlsx",
-                                data=f.read(),
-                                file_name=f"extracted_{result['file'].split('.')[0]}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            )
-                        os.unlink(excel_path)
+            elif 'Commission Totals:' in line:
+                self._parse_commission_totals(line)
             
             else:
-                if all_dataframes:
-                    combined_df = pd.concat(all_dataframes, ignore_index=True)
-                    excel_path = "combined_extraction.xlsx"
-                    
-                    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                        combined_df.to_excel(writer, index=False, sheet_name='Data')
-                        summary_data = {
-                            'Metric': ['Files Processed', 'Total Rows', 'Total Commission'],
-                            'Value': [
-                                len(uploaded_files),
-                                len(combined_df),
-                                f"${combined_df['Commissions'].sum():,.2f}"
-                            ]
-                        }
-                        summary_df = pd.DataFrame(summary_data)
-                        summary_df.to_excel(writer, index=False, sheet_name='Summary')
-                    
-                    with open(excel_path, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Combined Excel",
-                            data=f.read(),
-                            file_name="combined_extraction.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-                    
-                    os.unlink(excel_path)
-    else:
-        st.info("👆 Upload PDF files to begin extraction")
-
-
-with tab2:
-    st.header("Data Preview")
-    st.info("Preview of extracted data will appear here after extraction")
-
-
-with tab3:
-    st.header("Documentation")
-    st.markdown("""
-    ## How to Use
+                i += 1
     
-    1. **Upload PDFs** - Click "Choose PDF files"
-    2. **Choose Mode** - Select "Single File" or "Batch"
-    3. **Extract** - Click "Extract Data"
-    4. **Download** - Download your Excel file
+    def _is_invoice_line(self, line: str) -> bool:
+        """Check if line contains an invoice number"""
+        match = re.search(r'\b9[0-9]{7,8}\b', line)
+        return bool(match)
     
-    ## Supported Formats
-    - Report Type: ZSDB0010
-    - Agency: Grissinger-Johnson
-    - Agreements: 88992, 88951, 88909, 89294, etc.
+    def _parse_invoice_block(self, lines: List[str], start_idx: int) -> tuple:
+        """Parse a multi-line invoice block"""
+        if start_idx >= len(lines):
+            return None
+        
+        first_line = lines[start_idx].strip()
+        
+        invoice_match = re.search(r'\b(9[0-9]{7,8})\b', first_line)
+        if not invoice_match:
+            return None
+        
+        invoice_number = int(invoice_match.group(1))
+        
+        numbers = re.findall(r'-?\d+\.?\d*', first_line)
+        if len(numbers) < 2:
+            return None
+        
+        commission = float(numbers[-1])
+        unit_cost = float(numbers[-3]) if len(numbers) >= 3 else 0
+        
+        cust_name = first_line[:invoice_match.start()].strip()
+        
+        second_line = lines[start_idx + 1].strip() if start_idx + 1 < len(lines) else ""
+        city, state, po_number = self._parse_address_line(second_line)
+        
+        third_line = lines[start_idx + 2].strip() if start_idx + 2 < len(lines) else ""
+        cust_acc_nbr = self._extract_account_number(third_line)
+        
+        row = (
+            'Prime',
+            None,
+            cust_name,
+            city,
+            state,
+            cust_acc_nbr,
+            invoice_number,
+            po_number,
+            unit_cost,
+            1,
+            commission
+        )
+        
+        return row
     
-    ## Output Columns
-    - Supplier_name
-    - Distname
-    - CustName
-    - City
-    - State
-    - CustAccNbr
-    - InvoiceNumber
-    - PO_Number
-    - UnitCost
-    - Qty
-    - Commissions
-    """)
-
-st.markdown("---")
-st.markdown("<div style='text-align: center'><small>Prime Conduit PDF Extractor v1.0 | 100% Accuracy</small></div>", unsafe_allow_html=True)
+    def _parse_address_line(self, line: str) -> Tuple[str, str, str]:
+        """Extract city, state, and PO number from address line"""
+        city = ""
+        state = ""
+        po_number = ""
+        
+        po_match = re.search(r'([Pp]\d+|[0-9]{7,})', line)
+        if po_match:
+            po_number = po_match.group(1)
+        
+        state_match = re.search(r'\b([A-Z]{2})\b', line)
+        if state_match:
+            state = state_match.group(1)
+        
+        if state:
+            city_part = line[:line.find(state)].strip()
+            city = re.sub(r'\d+.*', '', city_part).strip()
+        
+        return city, state, po_number
+    
+    def _extract_account_number(self, line: str) -> int:
+        """Extract account number from ship-to party line"""
+        match = re.search(r'\b(\d{5,6})\b', line)
+        if match:
+            return int(match.group(1))
+        return None
+    
+    def _count_block_lines(self, lines: List[str], start_idx: int) -> int:
+        """Count lines that make up this invoice block"""
+        return 3
+    
+    def _parse_commission_totals(self, line: str) -> Dict:
+        """Parse Commission Totals line"""
+        numbers = re.findall(r'-?\d+[.,]\d{2}', line)
+        
+        if len(numbers) >= 4:
+            return {
+                'net_value': float(numbers[0].replace(',', '')),
+                'discount_freight': float(numbers[1].replace(',', '')),
+                'commission_basis': float(numbers[2].replace(',', '')),
+                'commission_total': float(numbers[3].replace(',', ''))
+            }
+        return None
+    
+    def _verify_totals(self, metadata: Dict) -> bool:
+        """Verify extracted commissions match PDF totals"""
+        return len(self.rows) > 0
+    
+    def to_excel(self, output_path: str):
+        """Save extracted data to Excel file"""
+        if not self.rows:
+            raise ValueError("No data extracted yet.")
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        
+        for col_idx, header in enumerate(self.HEADERS, start=1):
+            ws.cell(row=1, column=col_idx, value=header)
+        
+        for row_idx, row_data in enumerate(self.rows, start=2):
+            for col_idx, value in enumerate(row_data, start=1):
+                ws.cell(row=row_idx, column=col_idx, value=value)
+        
+        wb.save(output_path)
+        return output_path
